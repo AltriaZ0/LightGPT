@@ -1,0 +1,7 @@
+# 忽略特定大文件
+*.pt
+*.pth
+*.pkl
+*.txt
+*.ncu-rep
+__pycache__

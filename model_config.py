@@ -11,7 +11,7 @@ from torch.autograd import Variable
 txt_name = 'ymsh.txt' 
 
 # 训练与验证时使用的字符串长度
-block_size = 384
+block_size = 1024
 
 #分批的规模，代表同时处理多少条独立数据
 batch_size = 16

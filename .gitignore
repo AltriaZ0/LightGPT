@@ -4,4 +4,6 @@
 *.pkl
 *.txt
 *.ncu-rep
+*.nsys-rep
 __pycache__
+pthbackup

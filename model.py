@@ -44,8 +44,8 @@ class PositionalEncoding(nn.Module):
                             (-math.log(10000.0) / d_model)).cuda()
         
         # 应用正弦和余弦函数
-        pe[:, 0::2] = torch.sin(position * div_term).cuda()  # 偶数索引使用sin
-        pe[:, 1::2] = torch.cos(position * div_term).cuda()  # 奇数索引使用cos
+        pe[:, 0::2] = torch.sin(position * div_term).cuda() # 偶数索引使用sin
+        pe[:, 1::2] = torch.cos(position * div_term).cuda() # 奇数索引使用cos
         
         # 增加batch维度 (1, max_len, d_model)
         pe = pe.unsqueeze(0)
@@ -59,8 +59,29 @@ class PositionalEncoding(nn.Module):
         :return: 添加位置编码后的张量
         """
         # 添加位置编码（只取前x.size(1)个位置）
-        x = x + Variable(self.pe[:, :x.size(1)], requires_grad=False)
+        x = x + self.pe[:, :x.size(1)] 
         return self.dropout(x)
+    
+class Head(nn.Module):
+    def __init__(self,head_size):
+        super().__init__()
+        self.key = nn.Linear(Embedding_dim, head_size, bias = False)
+        self.query = nn.Linear(Embedding_dim, head_size, bias = False)
+        self.value = nn.Linear(Embedding_dim, head_size, bias = False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size))) # 上三角矩阵：不参与训练
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self,x):
+        B,T,C = x.shape
+        k = self.key(x) # (B,T,head_size)
+        q = self.query(x) # (B,T,head_size)
+        att = q @ k.transpose(-2,-1) * k.shape[-1] **-0.5  # KV运算：注意力方阵
+        att = att.masked_fill(self.tril[:T, :T]  == 0, float('-inf')) # 用负无穷填充上三角
+        att = F.softmax(att, dim=-1) # 按行做softmax
+        att = self.dropout(att)
+        v = self.value(x) # (B,T,head_size)
+        out = att @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
+        return out
 
 # 多头注意力
 class MultiHeadAttention(nn.Module):
@@ -73,7 +94,7 @@ class MultiHeadAttention(nn.Module):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
-#
+
 #  前馈网络
 class FeedForward(nn.Module):
     def __init__(self, Embedding_dim):
@@ -88,7 +109,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    def __init__(self, Embedding_dim, num_heads):
+    def __init__(self):
         super().__init__()
         self.sa = MultiHeadAttention(num_heads, head_size) # 自注意力
         self.ffwd = FeedForward(Embedding_dim) # 前向传播
@@ -105,16 +126,14 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, Embedding_dim)
         self.positional_encoding = PositionalEncoding(Embedding_dim, dropout=0.1, max_len=block_size)
-        self.blocks = nn.Sequential(*[Block(Embedding_dim, num_heads) for _ in range(numOfLayers)]) # 脚注⑤
+        self.blocks = nn.Sequential(*[Block() for _ in range(numOfLayers)]) # 脚注⑤
         self.ln_f = nn.LayerNorm(Embedding_dim) # 最后的层归一化
         self.lm_head = nn.Linear(Embedding_dim, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
         token_embd = self.token_embedding_table(idx)  # (B, T, Embedding_dim)
-        position_idx = torch.arange(T).cuda() 
-        position_embd = self.positional_encoding(token_embd)  # (T, Embedding_dim)
-        x = token_embd + position_embd  # (B, T, Embedding_dim)
+        x = self.positional_encoding(token_embd)  # (T, Embedding_dim)
         x = self.blocks(x)  # (B, T, Embedding_dim)
         x = self.ln_f(x)  # (B, T, Embedding_dim)
         logits = self.lm_head(x)
@@ -126,17 +145,25 @@ class LanguageModel(nn.Module):
             loss = None
         return logits, loss
     
-    def generate(self, token_seq, max_new_tokens=100):
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens=100):
+        """
+        输入: idx (B, T) 的起始序列
+        输出: 生成后的序列 (B, T + max_new_tokens)
+        """
         for _ in range(max_new_tokens):
-            tokens_input = token_seq[:, -block_size:]
-            logits, loss = self.forward(tokens_input)
-            logits = logits[:, -1, :]
+            # 截取上下文窗口
+            idx_cond = idx[:, -block_size:]
+            # 前向传播
+            logits, _ = self(idx_cond)
+            # 取最后一个时间步
+            logits = logits[:, -1, :]  # (B, vocab_size)
             probs = F.softmax(logits, dim=-1)
-            token_next = torch.multinomial(probs, num_samples=1).cuda() # 把概率分布向量变成one-hot向量，再变成整数token
-            token_seq = torch.cat((token_seq, token_next), dim=1)
-            new_tokens = token_seq[:, -max_new_tokens:]
-        print("生成token长度:", new_tokens.shape[1])
-        return new_tokens
+            # 采样
+            next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            # 拼接
+            idx = torch.cat((idx, next_token), dim=1)
+        return idx
 
 @torch.no_grad() # 不做梯度计算的decorator,作用域为整个函数
 def estimate_loss(model):
@@ -152,24 +179,5 @@ def estimate_loss(model):
     model.train() # 再转化为训练模式（如果之前没有转为evaluate模式，则不需要这一步，因为模型建立后默认为训练模式）
     return out
 
-class Head(nn.Module):
-    def __init__(self,head_size):
-        super().__init__()
-        self.key = nn.Linear(Embedding_dim, head_size, bias = False)
-        self.query = nn.Linear(Embedding_dim, head_size, bias = False)
-        self.value = nn.Linear(Embedding_dim, head_size, bias = False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size))) # 上三角矩阵：不参与训练
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self,x):
-        B,T,C = x.shape
-        k = self.key(x) # (B,T,head_size)
-        q = self.query(x) # (B,T,head_size)
-        att = q @ k.transpose(-2,-1) * k.shape[-1] **-0.5  # KV运算：注意力方阵
-        att = att.masked_fill(self.tril[:T, :T]  == 0, float('-inf')) # 用负无穷填充上三角
-        att = F.softmax(att, dim=-1) # 按行做softmax
-        att = self.dropout(att)
-        v = self.value(x) # (B,T,head_size)
-        out = att @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
-        return out
 

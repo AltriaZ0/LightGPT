@@ -3,6 +3,9 @@ from model_config import *
 from data import TextDataProcessor
 from nvtx import nvtx_range
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 processor = TextDataProcessor(txt_name="ymsh.txt")
 
 # 从处理器获取必要数据
@@ -65,51 +68,151 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1)] 
         return self.dropout(x)
     
+# class Head(nn.Module):
+#     def __init__(self,head_size):
+#         super().__init__()
+#         self.key = nn.Linear(, head_size, bias = False)
+#         self.query = nn.Linear(Embedding_dim, head_size, bias = False)
+#         self.value = nn.Linear(Embedding_dim, head_size, bias = False)
+#         with torch.cuda.nvtx.range("Tril"):
+#             self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size))) # 上三角矩阵：不参与训练
+#         self.dropout = nn.Dropout(dropout)
+
+#     @nvtx_range()
+#     def forward(self,x):
+#         with torch.cuda.nvtx.range("reshape"):
+#             B,T,C = x.shape
+#         with torch.cuda.nvtx.range("Linear:Key"):
+#             k = self.key(x) # (B,T,head_size)
+#         with torch.cuda.nvtx.range("Linear:Query"):
+#             q = self.query(x) # (B,T,head_size)
+#         with torch.cuda.nvtx.range("Attention computation"):
+#             with torch.cuda.nvtx.range("q@kT"):
+#                 att = q @ k.transpose(-2,-1) * k.shape[-1] **-0.5  # KV运算：注意力方阵
+#                 att = att.masked_fill(self.tril[:T, :T]  == 0, float('-inf')) # 用负无穷填充上三角
+#             with torch.cuda.nvtx.range("softmax"):
+#                 att = F.softmax(att, dim=-1) # 按行做softmax
+#             with torch.cuda.nvtx.range("Dropout"):
+#                 att = self.dropout(att)
+#             with torch.cuda.nvtx.range("Linear:Value"):
+#                 v = self.value(x) # (B,T,head_size)
+#             with torch.cuda.nvtx.range("att@v"):
+#                 out = att @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
+#         return out
+
+# 可选：提升 TF32 吞吐（Ampere+）
+torch.set_float32_matmul_precision("high")  # 或 "highest"
+
 class Head(nn.Module):
-    def __init__(self,head_size):
+    def __init__(self, head_size):
         super().__init__()
-        self.key = nn.Linear(Embedding_dim, head_size, bias = False)
-        self.query = nn.Linear(Embedding_dim, head_size, bias = False)
-        self.value = nn.Linear(Embedding_dim, head_size, bias = False)
-        with torch.cuda.nvtx.range("Tril"):
-            self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size))) # 上三角矩阵：不参与训练
-        self.dropout = nn.Dropout(dropout)
+        self.key   = nn.Linear(Embedding_dim, head_size, bias=False)
+        self.query = nn.Linear(Embedding_dim, head_size, bias=False)
+        self.value = nn.Linear(Embedding_dim, head_size, bias=False)
+        self.dropout_p = float(dropout)
 
-    @nvtx_range()
-    def forward(self,x):
-        with torch.cuda.nvtx.range("reshape"):
-            B,T,C = x.shape
-        with torch.cuda.nvtx.range("Linear:Key"):
-            k = self.key(x) # (B,T,head_size)
-        with torch.cuda.nvtx.range("Linear:Query"):
-            q = self.query(x) # (B,T,head_size)
-        with torch.cuda.nvtx.range("Attention computation"):
-            with torch.cuda.nvtx.range("q@kT"):
-                att = q @ k.transpose(-2,-1) * k.shape[-1] **-0.5  # KV运算：注意力方阵
-                att = att.masked_fill(self.tril[:T, :T]  == 0, float('-inf')) # 用负无穷填充上三角
-            with torch.cuda.nvtx.range("softmax"):
-                att = F.softmax(att, dim=-1) # 按行做softmax
-            with torch.cuda.nvtx.range("Dropout"):
-                att = self.dropout(att)
-            with torch.cuda.nvtx.range("Linear:Value"):
-                v = self.value(x) # (B,T,head_size)
-            with torch.cuda.nvtx.range("att@v"):
-                out = att @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
-        return out
-    
-
-# 多头注意力
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(num_heads * head_size, Embedding_dim)
-        self.dropout = nn.Dropout(dropout)
+        # 不再需要 tril 缓冲
+        # self.register_buffer("tril", ...)
+        
     @nvtx_range()
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
+        # x: (B, T, C)
+        B, T, C = x.shape
+
+        with torch.cuda.nvtx.range("Linear:Key"):
+            k = self.key(x)   # (B, T, head_size)
+        with torch.cuda.nvtx.range("Linear:Query"):
+            q = self.query(x) # (B, T, head_size)
+        with torch.cuda.nvtx.range("Linear:Value"):
+            v = self.value(x) # (B, T, head_size)
+
+        # 扩成 (B, H=1, T, head_size)
+        q = q.unsqueeze(1)
+        k = k.unsqueeze(1)
+        v = v.unsqueeze(1)
+
+        # 训练用 dropout_p，eval 时为 0.0
+        p = self.dropout_p if self.training and self.dropout_p > 0 else 0.0
+
+        # 可选：强制/偏向 FlashAttention；若不满足条件会自动回退（比如 dtype/shape）
+        # 仅当你想“尽量走 Flash”时打开；否则可直接调用 F.scaled_dot_product_attention
+        with torch.cuda.nvtx.range("SDPA(causal)"):
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,    # 因果掩码由 is_causal 处理
+                dropout_p=p,
+                is_causal=True
+            )  # (B, 1, T, head_size)
+
+        out = out.squeeze(1)  # (B, T, head_size)
         return out
+
+
+
+    
+
+# 多头注意力 old版本
+# class MultiHeadAttention(nn.Module):
+#     def __init__(self, num_heads, head_size):
+#         super().__init__()
+#         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+#         self.proj = nn.Linear(num_heads * head_size, Embedding_dim)
+#         self.dropout = nn.Dropout(dropout)
+#     @nvtx_range()
+#     def forward(self, x):
+#         out = torch.cat([h(x) for h in self.heads], dim=-1)
+#         out = self.dropout(self.proj(out))
+#         return out
+
+# 多头注意力 优化版本
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias: bool=False):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim  = embed_dim
+        self.num_heads  = num_heads
+        self.head_dim   = embed_dim // num_heads
+        self.dropout_p  = float(dropout)
+
+        # 一次线性得到 QKV（比逐头 Linear 高效得多）
+        self.W_qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
+        # 输出投影
+        self.proj  = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    @nvtx_range()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C)
+        B, T, C = x.shape
+
+        # 1) 一次性得到 QKV，并 reshape 成 (B, H, T, Dh)
+        with torch.cuda.nvtx.range("qkv_linear"):
+            qkv = self.W_qkv(x)                                     # (B, T, 3C)
+            q, k, v = qkv.chunk(3, dim=-1)                          # 三份 (B, T, C)
+            # 变成 (B, H, T, Dh)，注意先 contiguous 再 view/reshape
+            q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+            k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+            v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+        # 2) SDPA：所有头在一个/两个大核里并行完成
+        p = self.dropout_p if self.training and self.dropout_p > 0 else 0.0
+        AMP_DTYPE = torch.bfloat16  # Ada/Lovelace 推荐 BF16；也可用 torch.float16
+        with torch.autocast("cuda", dtype=AMP_DTYPE):
+            with torch.cuda.nvtx.range("SDPA(causal)"):
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=p,
+                    is_causal=True
+                )                                                    # (B, H, T, Dh)
+
+        # 3) 合并头并做输出投影
+        with torch.cuda.nvtx.range("proj"):
+            out = attn_out.transpose(1, 2).reshape(B, T, C)          # (B, T, C)
+            out = self.dropout(self.proj(out))                       # (B, T, C)
+        return out
+
+
 
 
 #  前馈网络
@@ -130,7 +233,7 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     def __init__(self):
         super().__init__()
-        self.sa = MultiHeadAttention(num_heads, head_size) # 自注意力
+        self.sa = MultiHeadAttention(Embedding_dim, num_heads) # 自注意力
         self.ffwd = FeedForward(Embedding_dim) # 前向传播
         self.ln1 = nn.LayerNorm(Embedding_dim) # 层归一化
         self.ln2 = nn.LayerNorm(Embedding_dim)

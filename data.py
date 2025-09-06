@@ -4,6 +4,7 @@ from model_config import *
 from torch.autograd import Variable
 import os
 import pickle
+from nvtx import nvtx_range
 
 class TextDataProcessor:
     def __init__(self, txt_name, train_ratio=0.9, seed=42, cache_dir='./data_cache'):
@@ -120,27 +121,27 @@ class TextDataProcessor:
             print(f"已清除缓存: {cache_file}")
         else:
             print("缓存文件不存在")
-    
+    @nvtx_range()
     def encode_text(self, text):
         """将文本转换为索引列表"""
         return [self.char_to_idx[c] for c in text if c in self.char_to_idx]
-    
+    @nvtx_range()
     def decode_text(self, indices):
         """将索引列表转换为文本"""
         return ''.join(self.idx_to_char[i] for i in indices if i in self.idx_to_char)
-    
+    @nvtx_range()
     def get_vocab_size(self):
         """获取词汇表大小"""
         return self.vocab_size
-    
+    @nvtx_range()
     def get_train_data(self):
         """获取训练数据"""
         return self.train_data
-    
+    @nvtx_range()
     def get_val_data(self):
         """获取验证数据"""
         return self.val_data
-    
+    @nvtx_range()
     def save_mappings(self, dir_path='.'):
         """保存字符映射到文件"""
         os.makedirs(dir_path, exist_ok=True)

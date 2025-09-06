@@ -18,7 +18,7 @@ batch_size = 16
 
 Embedding_dim = 512 # 嵌入层的维度
 
-max_new_tokens = 500 # 生成文本的最大新令牌数
+max_new_tokens = 100 # 生成文本的最大新令牌数
 
 learning_rate = 3e-4 #学习率
 

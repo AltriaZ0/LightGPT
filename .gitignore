@@ -6,5 +6,8 @@
 *.ncu-rep
 *.nsys-rep
 *.sqlite
+*.bin
+*.json
+
 __pycache__
 pthbackup

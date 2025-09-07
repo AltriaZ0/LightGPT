@@ -1,27 +1,9 @@
-
-from model_config import *
 from data import TextDataProcessor
 from nvtx import nvtx_range
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-processor = TextDataProcessor(txt_name="ymsh.txt")
-
-# 从处理器获取必要数据
-train_data = processor.get_train_data()
-val_data = processor.get_val_data()
-vocab_size = processor.get_vocab_size()
-idx_to_char = processor.idx_to_char  # 获取索引到字符的映射
-
-# Batching
-@nvtx_range()
-def get_batch(split, batch_size, block_size):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix]).cuda()
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix]).cuda()
-    return x, y
+import math
 
 # 位置编码
 class PositionalEncoding(nn.Module):
@@ -35,14 +17,14 @@ class PositionalEncoding(nn.Module):
         :param dropout: dropout概率
         :param max_len: 最大序列长度
         """
-        super(PositionalEncoding, self).__init__()
+        super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         
         # 创建位置编码矩阵 (max_len, d_model)
         pe = torch.zeros(max_len, d_model)
         
         # 位置索引 [0, 1, 2, ..., max_len-1]
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1).cuda()
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1).cuda()
         
         # 计算频率项 (d_model/2)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
@@ -65,105 +47,10 @@ class PositionalEncoding(nn.Module):
         :return: 添加位置编码后的张量
         """
         # 添加位置编码（只取前x.size(1)个位置）
-        x = x + self.pe[:, :x.size(1)] 
+        T = x.size(1)
+        x = x + self.pe[:, :T, :].to(dtype=x.dtype)
         return self.dropout(x)
     
-# class Head(nn.Module):
-#     def __init__(self,head_size):
-#         super().__init__()
-#         self.key = nn.Linear(, head_size, bias = False)
-#         self.query = nn.Linear(Embedding_dim, head_size, bias = False)
-#         self.value = nn.Linear(Embedding_dim, head_size, bias = False)
-#         with torch.cuda.nvtx.range("Tril"):
-#             self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size))) # 上三角矩阵：不参与训练
-#         self.dropout = nn.Dropout(dropout)
-
-#     @nvtx_range()
-#     def forward(self,x):
-#         with torch.cuda.nvtx.range("reshape"):
-#             B,T,C = x.shape
-#         with torch.cuda.nvtx.range("Linear:Key"):
-#             k = self.key(x) # (B,T,head_size)
-#         with torch.cuda.nvtx.range("Linear:Query"):
-#             q = self.query(x) # (B,T,head_size)
-#         with torch.cuda.nvtx.range("Attention computation"):
-#             with torch.cuda.nvtx.range("q@kT"):
-#                 att = q @ k.transpose(-2,-1) * k.shape[-1] **-0.5  # KV运算：注意力方阵
-#                 att = att.masked_fill(self.tril[:T, :T]  == 0, float('-inf')) # 用负无穷填充上三角
-#             with torch.cuda.nvtx.range("softmax"):
-#                 att = F.softmax(att, dim=-1) # 按行做softmax
-#             with torch.cuda.nvtx.range("Dropout"):
-#                 att = self.dropout(att)
-#             with torch.cuda.nvtx.range("Linear:Value"):
-#                 v = self.value(x) # (B,T,head_size)
-#             with torch.cuda.nvtx.range("att@v"):
-#                 out = att @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
-#         return out
-
-# 可选：提升 TF32 吞吐（Ampere+）
-torch.set_float32_matmul_precision("high")  # 或 "highest"
-
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
-        self.key   = nn.Linear(Embedding_dim, head_size, bias=False)
-        self.query = nn.Linear(Embedding_dim, head_size, bias=False)
-        self.value = nn.Linear(Embedding_dim, head_size, bias=False)
-        self.dropout_p = float(dropout)
-
-        # 不再需要 tril 缓冲
-        # self.register_buffer("tril", ...)
-        
-    @nvtx_range()
-    def forward(self, x):
-        # x: (B, T, C)
-        B, T, C = x.shape
-
-        with torch.cuda.nvtx.range("Linear:Key"):
-            k = self.key(x)   # (B, T, head_size)
-        with torch.cuda.nvtx.range("Linear:Query"):
-            q = self.query(x) # (B, T, head_size)
-        with torch.cuda.nvtx.range("Linear:Value"):
-            v = self.value(x) # (B, T, head_size)
-
-        # 扩成 (B, H=1, T, head_size)
-        q = q.unsqueeze(1)
-        k = k.unsqueeze(1)
-        v = v.unsqueeze(1)
-
-        # 训练用 dropout_p，eval 时为 0.0
-        p = self.dropout_p if self.training and self.dropout_p > 0 else 0.0
-
-        # 可选：强制/偏向 FlashAttention；若不满足条件会自动回退（比如 dtype/shape）
-        # 仅当你想“尽量走 Flash”时打开；否则可直接调用 F.scaled_dot_product_attention
-        with torch.cuda.nvtx.range("SDPA(causal)"):
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,    # 因果掩码由 is_causal 处理
-                dropout_p=p,
-                is_causal=True
-            )  # (B, 1, T, head_size)
-
-        out = out.squeeze(1)  # (B, T, head_size)
-        return out
-
-
-
-    
-
-# 多头注意力 old版本
-# class MultiHeadAttention(nn.Module):
-#     def __init__(self, num_heads, head_size):
-#         super().__init__()
-#         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-#         self.proj = nn.Linear(num_heads * head_size, Embedding_dim)
-#         self.dropout = nn.Dropout(dropout)
-#     @nvtx_range()
-#     def forward(self, x):
-#         out = torch.cat([h(x) for h in self.heads], dim=-1)
-#         out = self.dropout(self.proj(out))
-#         return out
-
 # 多头注意力 优化版本
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias: bool=False):
@@ -206,18 +93,15 @@ class MultiHeadAttention(nn.Module):
                     is_causal=True
                 )                                                    # (B, H, T, Dh)
 
-        # 3) 合并头并做输出投影
-        with torch.cuda.nvtx.range("proj"):
-            out = attn_out.transpose(1, 2).reshape(B, T, C)          # (B, T, C)
-            out = self.dropout(self.proj(out))                       # (B, T, C)
+            # 3) 合并头并做输出投影
+            with torch.cuda.nvtx.range("proj"):
+                out = attn_out.transpose(1, 2).reshape(B, T, C)          # (B, T, C)
+                out = self.dropout(self.proj(out))                       # (B, T, C)
         return out
-
-
-
 
 #  前馈网络
 class FeedForward(nn.Module):
-    def __init__(self, Embedding_dim):
+    def __init__(self, Embedding_dim, dropout=0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(Embedding_dim, Embedding_dim * 4),
@@ -231,10 +115,10 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    def __init__(self):
+    def __init__(self, Embedding_dim, num_heads, dropout=0.1):
         super().__init__()
         self.sa = MultiHeadAttention(Embedding_dim, num_heads) # 自注意力
-        self.ffwd = FeedForward(Embedding_dim) # 前向传播
+        self.ffwd = FeedForward(Embedding_dim, dropout=0.1) # 前向传播
         self.ln1 = nn.LayerNorm(Embedding_dim) # 层归一化
         self.ln2 = nn.LayerNorm(Embedding_dim)
 
@@ -246,14 +130,44 @@ class Block(nn.Module):
 
 # 语言模型
 class LanguageModel(nn.Module):
-    def __init__(self):
+    def __init__(self,
+                 vocab_size: int,
+                 block_size: int,
+                 embed_dim: int,
+                 num_heads: int,
+                 num_layers: int,
+                 dropout: float = 0.1,
+                 tie_weights: bool = True):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, Embedding_dim)
-        self.positional_encoding = PositionalEncoding(Embedding_dim, dropout=0.1, max_len=block_size)
-        self.blocks = nn.Sequential(*[Block() for _ in range(numOfLayers)]) # 脚注⑤
-        self.ln_f = nn.LayerNorm(Embedding_dim) # 最后的层归一化
-        self.lm_head = nn.Linear(Embedding_dim, vocab_size)
-        
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.embed_dim  = embed_dim
+        self.num_heads = num_heads
+        self.token_embedding_table = nn.Embedding(vocab_size, embed_dim)
+        self.positional_encoding = PositionalEncoding(embed_dim, dropout=0.1, max_len=block_size)
+        self.blocks = nn.Sequential(*[Block(embed_dim, num_heads, dropout) for _ in range(num_layers)]) # 脚注⑤
+        self.ln_f = nn.LayerNorm(embed_dim) # 最后的层归一化
+        self.lm_head = nn.Linear(embed_dim, vocab_size)
+
+        # 权重共享：lm_head weight 与 embedding weight 绑定
+        # todo：研究
+        if tie_weights:
+            self.lm_head.weight = self.token_embedding_table.weight
+
+        # 参数初始化（GPT 风格，兼容 sdpa）
+        # todo：研究
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
     @nvtx_range()
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -264,12 +178,12 @@ class LanguageModel(nn.Module):
        
         x = self.blocks(x)  # (B, T, Embedding_dim)
 
-        with torch.cuda.nvtx.range("Final    and Linear"):
+        with torch.cuda.nvtx.range("Final and Linear"):
             x = self.ln_f(x)  # (B, T, Embedding_dim)
             logits = self.lm_head(x)
 
         if targets is not None:
-            logits = logits.view(B * T, vocab_size)
+            logits = logits.view(B * T, self.vocab_size)
             targets = targets.view(B * T)
             loss = F.cross_entropy(logits, targets) #交叉熵
         else:
@@ -285,7 +199,7 @@ class LanguageModel(nn.Module):
         """
         for _ in range(max_new_tokens):
             # 截取上下文窗口
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -self.block_size:]
             # 前向传播
             logits, _ = self(idx_cond)
             # 取最后一个时间步
@@ -296,21 +210,5 @@ class LanguageModel(nn.Module):
             # 拼接
             idx = torch.cat((idx, next_token), dim=1)
         return idx
-
-@torch.no_grad() # 不做梯度计算的decorator,作用域为整个函数
-@nvtx_range()
-def estimate_loss(model):
-    out = {}
-    model.eval() # 把模型转化为evaluate模式（默认模式是train）
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters) # 建立一个初始值为0的容器，用于储存loss值
-        for k in range(eval_iters):
-            X, Y = get_batch(split, batch_size, block_size) # split是一个字符串，用来控制get_batch()函数的行为
-            logits, loss = model(X, Y) # model的输入值一个是index（以每个字符的序号表示的序列），一个是target
-            losses[k] = loss.item()
-        out[split] = losses.mean() # out是含有两个元素的字典，一个是train，一个是val，每个元素对应一个loss的平均值
-    model.train() # 再转化为训练模式（如果之前没有转为evaluate模式，则不需要这一步，因为模型建立后默认为训练模式）
-    return out
-
 
 

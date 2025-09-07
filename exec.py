@@ -1,26 +1,90 @@
-from model_config import *
+from model_exec_config import *
 from model import LanguageModel
 from data_save import DataSaver
 import torch
 import torch.nn.functional as F
 import random
 from nvtx import nvtx_range
+import os, json, pickle, glob
+from data import MemmapTokenDataset  # 你之前的 data.py 里已经定义
+
+def _resolve_path(base_dir, p):
+    """把 meta.json 内的相对 bin 路径解析成绝对路径；若已是绝对路径原样返回"""
+    if os.path.isabs(p):
+        return p
+    return os.path.normpath(os.path.join(base_dir, p))
+
+def load_vocab_and_val_dataset(cache_dir="./data_cache", meta_path=None):
+    """
+    从 TextDataProcessor 的缓存三件套加载：
+    - 词表: *.char_map.pkl -> char_to_idx, idx_to_char, vocab_size
+    - 验证集: *.tokens.bin + *.meta.json -> MemmapTokenDataset 切片 (val)
+    """
+    cache_dir = os.path.abspath(cache_dir)
+
+    # 1) 定位 meta.json
+    if meta_path is None:
+        metas = glob.glob(os.path.join(cache_dir, "*.meta.json"))
+        if not metas:
+            raise FileNotFoundError(f"在 {cache_dir} 未找到 *.meta.json")
+        if len(metas) > 1:
+            raise RuntimeError("发现多个 *.meta.json，请显式指定 meta_path：\n" + "\n".join(metas))
+        meta_path = metas[0]
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    meta_dir = os.path.dirname(os.path.abspath(meta_path))
+    # 2) 解析 bin_path
+    bin_path = _resolve_path(meta_dir, os.path.basename(meta["bin_path"]))
+
+    # 3) 定位 char_map.pkl（按 txt_name 派生；兜底通配）
+    txt_basename = os.path.basename(meta.get("txt_name", ""))  # e.g. FullNovel.txt
+    if txt_basename:
+        map_path = os.path.join(meta_dir, f"{txt_basename}.char_map.pkl")
+    else:
+        cands = glob.glob(os.path.join(meta_dir, "*.char_map.pkl"))
+        if not cands:
+            raise FileNotFoundError("未找到 *.char_map.pkl（且 meta.json 缺少 txt_name 字段）。")
+        map_path = cands[0]
+
+    with open(map_path, "rb") as f:
+        maps = pickle.load(f)
+    char_to_idx = maps["char_to_idx"]
+    idx_to_char = maps["idx_to_char"]
+    vocab_size  = maps["vocab_size"]
+
+    # 4) 基于 meta 切出 val memmap 视图
+    n_total   = int(meta["n_total"])
+    split_idx = int(meta["split_idx"])
+    dtype     = meta["dtype"]  # 'uint16' 或 'uint32'
+
+    # 简单尺寸校验（可选）
+    dtype_bytes = 2 if dtype == "uint16" else 4
+    expected_bytes = n_total * dtype_bytes
+    actual_bytes   = os.path.getsize(bin_path)
+    if expected_bytes != actual_bytes:
+        raise ValueError(f".tokens.bin 尺寸不匹配：expect={expected_bytes}, actual={actual_bytes}\n  {bin_path}")
+
+    # val 数据集（不把整集读入内存）
+    val_ds = MemmapTokenDataset(bin_path, split_idx, n_total - split_idx, dtype=dtype)
+
+    return (char_to_idx, idx_to_char, vocab_size), val_ds, meta_path
 
 # 推理专用处理器
 class InferenceProcessor:
-    def __init__(self, state):
-        self.char_to_idx = state['char_to_idx']
-        self.idx_to_char = state['idx_to_char']
-        self.vocab_size = state['vocab_size']
+    def __init__(self, vocab_state):
+        # 改：直接接收 (char_to_idx, idx_to_char, vocab_size)
+        self.char_to_idx, self.idx_to_char, self.vocab_size = vocab_state
 
     @nvtx_range()
     def decode_text(self, indices):
-        """将 token 索引列表转为字符串，忽略无效索引"""
-        return ''.join(self.idx_to_char.get(i, '?') for i in indices)  # 用 ? 代替未知索引
+        return ''.join(self.idx_to_char.get(int(i), '?') for i in indices)
+
     @nvtx_range()
     def encode_text(self, text):
-        """将字符串转为 token 索引列表，未知字符跳过或用默认值"""
-        return [self.char_to_idx.get(c, 0) for c in text]  # 0 可视为 <unk> 或 padding
+        return [self.char_to_idx.get(c, 0) for c in text]  # 0 作为 <unk>
+
 
 @nvtx_range()
 def generate_streaming(model, processor, context, max_new_tokens=100, temperature=1.0, top_k=None):
@@ -69,27 +133,20 @@ def generate_streaming(model, processor, context, max_new_tokens=100, temperatur
 @nvtx_range()
 def output():
     # 标记一个代码段开始
+    with torch.cuda.nvtx.range("加载处理器状态与验证集"):
+        vocab_state, val_data, meta_path = load_vocab_and_val_dataset(cache_dir="data_cache", meta_path=None)
+        processor = InferenceProcessor(vocab_state)
+        vocab_size_from_cache = processor.vocab_size
+
     with torch.cuda.nvtx.range("Load Model"):
-        # 1. 加载模型
-        model = LanguageModel().cuda()
-        model.eval()  # 重要：切换到评估模式
-
-    with torch.cuda.nvtx.range("加载处理器状态"):
-        # 2. 加载处理器状态
-        persister = DataSaver()
-        processor_state = persister.load_processor_state("data_cache/processor_state.pkl")
-        processor = InferenceProcessor(processor_state)
-
-    with torch.cuda.nvtx.range("加载文本数据"):
-        # 3. 加载数据（用于随机上下文和真实对比）
-        data_tensors = persister.load_data_tensors("data_cache/data_tensors.pt")
-        val_data = data_tensors['val_data']
-
+        # 用缓存的 vocab_size 实例化模型，超参仍来自 model_config
+        model = LanguageModel(vocab_size_from_cache, block_size, Embedding_dim, num_heads, numOfLayers, dropout).cuda()
+        model.eval()
+        
+    # 加载模型权重
     torch.cuda.nvtx.range_push("Load Weights")
-    # 4. 加载权重
     model.load_state_dict(torch.load('model_weights.pth', map_location='cuda'))
     print("模型加载完成")
-    # 结束标记
     torch.cuda.nvtx.range_pop()
 
 

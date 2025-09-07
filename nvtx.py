@@ -1,5 +1,4 @@
 # NVTX标记 装饰器函数，用于Nsight system 性能分析
-
 import torch
 import functools
 import os
@@ -38,6 +37,5 @@ def nvtx_range(name=None, color=None):
                 return func(*args, **kwargs)
             finally:
                 torch.cuda.nvtx.range_pop()
-
         return wrapper
     return decorator

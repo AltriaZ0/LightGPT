@@ -5,3 +5,4 @@
 # GeLU和ReLU--激活函数的区别和优劣
 # 权重绑定的好处
 # self.apply(self._init_weights) = 递归调用自定义初始化
+# RMSNorm vs LayerNorm

@@ -1,6 +1,5 @@
 from model_exec_config import *
 from model import LanguageModel
-from data_save import DataSaver
 import torch
 import torch.nn.functional as F
 import random
@@ -106,9 +105,10 @@ def generate_streaming(model, processor, context, max_new_tokens=100, temperatur
 
             # 截取上下文窗口
             input_tokens = generated_tokens[:, -block_size:]  # (1, block_size)
-
-            # 前向传播
-            logits, _ = model(input_tokens)  # (1, block_size, vocab_size)
+            AMP_DTYPE = torch.bfloat16  # 或 torch.float16
+            with torch.autocast("cuda", dtype=AMP_DTYPE):
+                # 前向传播
+                logits, _ = model(input_tokens)  # (1, block_size, vocab_size)
             logits = logits[:, -1, :] / temperature  # 只取最后一个 token，应用温度
 
 

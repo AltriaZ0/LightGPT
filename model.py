@@ -17,14 +17,14 @@ class PositionalEncoding(nn.Module):
         :param dropout: dropout概率
         :param max_len: 最大序列长度
         """
-        super().__init__()
+        super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         
         # 创建位置编码矩阵 (max_len, d_model)
         pe = torch.zeros(max_len, d_model)
         
         # 位置索引 [0, 1, 2, ..., max_len-1]
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1).cuda()
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1).cuda()
         
         # 计算频率项 (d_model/2)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
@@ -154,18 +154,18 @@ class LanguageModel(nn.Module):
         if tie_weights:
             self.lm_head.weight = self.token_embedding_table.weight
 
-        # 参数初始化（GPT 风格，兼容 sdpa）
-        # todo：研究
-        self.apply(self._init_weights)
+        # # 参数初始化（GPT 风格，兼容 sdpa）
+        # # todo：研究
+        # self.apply(self._init_weights)
 
-    @staticmethod
-    def _init_weights(module: nn.Module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    # @staticmethod
+    # def _init_weights(module: nn.Module):
+    #     if isinstance(module, nn.Linear):
+    #         nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    #         if module.bias is not None:
+    #             nn.init.zeros_(module.bias)
+    #     elif isinstance(module, nn.Embedding):
+    #         nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
     @nvtx_range()

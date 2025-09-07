@@ -23,7 +23,7 @@ max_new_tokens = 100 # 生成文本的最大新令牌数
 learning_rate = 3e-4 #学习率
 
 iters = 20000 # 训练迭代次数
-eval_iters = 10 # 评估迭代次数
+eval_iters = 1 # 评估迭代次数
 
 eval_interval = int( iters / eval_iters  ) # 评估间隔
 
